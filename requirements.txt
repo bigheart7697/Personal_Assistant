@@ -1,0 +1,29 @@
+# MCP Server Dependencies - Production Grade
+# Python 3.8+ required
+
+# MCP SDK (eliminates JSON-RPC boilerplate)
+fastmcp>=0.1.0
+
+# Input Validation (automatic with FastMCP)
+pydantic>=2.0.0
+
+# Observability & Monitoring
+opentelemetry-api==1.21.0
+opentelemetry-sdk==1.21.0
+opentelemetry-exporter-otlp==1.21.0
+
+# Day 2: Semantic Memory & Vector Embeddings
+sentence-transformers>=2.2.0  # Semantic search with embeddings
+numpy>=1.24.0                 # Vector operations
+faiss-cpu>=1.7.4             # Efficient similarity search
+
+# Standard library modules used:
+# - json (JSON encoding/decoding)
+# - os (environment variables)
+# - pathlib (file system operations)
+# - typing (type hints)
+# - logging (structured logging)
+# - time (performance tracking)
+# - enum (error categorization)
+# - datetime (timestamps)
+

@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "strategic-notes": {
+      "command": "python",
+      "args": ["mcp_server.py"],
+      "env": {
+        "NOTES_PATH": "./notes"
+      },
+      "description": "Strategic note-taking assistant with Think-Act-Observe loop",
+      "transport": "stdio"
+    }
+  },
+  "serverInfo": {
+    "name": "strategic-note-taking-mcp-server",
+    "version": "1.0.0",
+    "protocolVersion": "2024-11-05"
+  },
+  "documentation": {
+    "tools": {
+      "list_note_folders": {
+        "purpose": "Discovery tool to scan existing note categories",
+        "usage": "Call this BEFORE attempting to save any notes",
+        "returnType": "JSON with folder list and metadata"
+      },
+      "write_note": {
+        "purpose": "Action tool to save markdown notes",
+        "usage": "Use ONLY after discovering valid folders",
+        "validation": "Folder must exist, file_name should end in .md"
+      }
+    },
+    "workflow": [
+      "1. User provides note content",
+      "2. Assistant calls list_note_folders (Observe)",
+      "3. Assistant analyzes folders (Think)",
+      "4. Assistant calls write_note (Act)",
+      "5. System returns success or error (Observe)"
+    ]
+  }
+}
+

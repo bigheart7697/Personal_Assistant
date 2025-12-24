@@ -1,0 +1,64 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+audit.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+notes/
+Agent Workshop/
+DAY2_SUMMARY.md
+DAY2_QUICKSTART.md
+DAY2_CONTEXT_ENGINEERING.md
+INSTALL_DAY2.md
+PROJECT_SUMMARY.md
+PRODUCTION_UPGRADE.md
+V3_UPGRADE.md
+WORKSHOP_IMPROVEMENTS.md
+QUICKSTART.md
+!notes/README.md
+
