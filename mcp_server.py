@@ -13,6 +13,11 @@ Production-grade implementation with:
 - Audit logging
 - Enhanced security validation
 - Configuration management
+- Resources primitive for note reading
+- Prompts primitive for common workflows
+- Elicitation for user confirmations
+- Rate limiting per agent/session
+- OAuth 2.0 authorization support
 """
 
 import json
@@ -21,10 +26,14 @@ import logging
 import time
 import re
 import pickle
+import hashlib
+import secrets
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+from dataclasses import dataclass
 
 # FastMCP and Pydantic imports
 from fastmcp import FastMCP
@@ -72,11 +81,211 @@ class ServerConfig:
         self.max_file_size_mb = int(os.environ.get("MAX_FILE_SIZE_MB", "10"))
         self.embedding_model = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
         
+        # Rate limiting configuration
+        self.enable_rate_limiting = os.environ.get("ENABLE_RATE_LIMITING", "true").lower() == "true"
+        self.rate_limit_requests = int(os.environ.get("RATE_LIMIT_REQUESTS", "100"))
+        self.rate_limit_window_seconds = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+        
+        # OAuth 2.0 configuration
+        self.enable_oauth = os.environ.get("ENABLE_OAUTH", "false").lower() == "true"
+        self.oauth_client_id = os.environ.get("OAUTH_CLIENT_ID", "")
+        self.oauth_client_secret = os.environ.get("OAUTH_CLIENT_SECRET", "")
+        self.oauth_token_url = os.environ.get("OAUTH_TOKEN_URL", "")
+        self.oauth_scopes = os.environ.get("OAUTH_SCOPES", "notes:read notes:write").split()
+        
+        # Elicitation (user confirmation) configuration
+        self.enable_elicitation = os.environ.get("ENABLE_ELICITATION", "true").lower() == "true"
+        self.require_confirmation_for_overwrite = os.environ.get("REQUIRE_CONFIRMATION_OVERWRITE", "true").lower() == "true"
+        
     def is_production(self) -> bool:
         return self.environment == "production"
     
     def is_development(self) -> bool:
         return self.environment == "development"
+
+
+@dataclass
+class OAuthToken:
+    """OAuth 2.0 token information"""
+    access_token: str
+    token_type: str
+    expires_at: datetime
+    scopes: List[str]
+    agent_id: str
+    
+    def is_expired(self) -> bool:
+        return datetime.now(timezone.utc) >= self.expires_at
+    
+    def has_scope(self, required_scope: str) -> bool:
+        return required_scope in self.scopes
+
+
+class OAuthManager:
+    """
+    OAuth 2.0 Authorization Manager
+    Implements authorization code grant flow as recommended in MCP whitepaper (page 39)
+    """
+    
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self.tokens: Dict[str, OAuthToken] = {}  # agent_id -> token
+        self.authorization_codes: Dict[str, Dict[str, Any]] = {}  # code -> {agent_id, scopes, expires}
+    
+    def is_enabled(self) -> bool:
+        return self.config.enable_oauth
+    
+    def generate_authorization_code(self, agent_id: str, scopes: List[str]) -> str:
+        """Generate a new authorization code"""
+        code = secrets.token_urlsafe(32)
+        self.authorization_codes[code] = {
+            "agent_id": agent_id,
+            "scopes": scopes,
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10)
+        }
+        return code
+    
+    def exchange_code_for_token(self, code: str) -> Optional[OAuthToken]:
+        """Exchange authorization code for access token"""
+        if code not in self.authorization_codes:
+            return None
+        
+        code_data = self.authorization_codes[code]
+        if datetime.now(timezone.utc) >= code_data["expires_at"]:
+            del self.authorization_codes[code]
+            return None
+        
+        # Generate access token
+        token = OAuthToken(
+            access_token=secrets.token_urlsafe(32),
+            token_type="Bearer",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            scopes=code_data["scopes"],
+            agent_id=code_data["agent_id"]
+        )
+        
+        self.tokens[token.access_token] = token
+        del self.authorization_codes[code]
+        return token
+    
+    def validate_token(self, access_token: str) -> Optional[OAuthToken]:
+        """Validate and return token information"""
+        if not self.is_enabled():
+            # If OAuth is disabled, return a permissive token
+            return OAuthToken(
+                access_token="dev-token",
+                token_type="Bearer",
+                expires_at=datetime.now(timezone.utc) + timedelta(days=365),
+                scopes=["notes:read", "notes:write", "memory:read", "memory:write"],
+                agent_id="development"
+            )
+        
+        token = self.tokens.get(access_token)
+        if not token or token.is_expired():
+            return None
+        return token
+    
+    def check_scope(self, access_token: str, required_scope: str) -> bool:
+        """Check if token has required scope"""
+        token = self.validate_token(access_token)
+        if not token:
+            return False
+        return token.has_scope(required_scope)
+
+
+class RateLimiter:
+    """
+    Rate limiting per agent/session
+    Addresses whitepaper concern about DoS attacks and resource exhaustion
+    """
+    
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self.requests: Dict[str, List[datetime]] = defaultdict(list)
+    
+    def is_enabled(self) -> bool:
+        return self.config.enable_rate_limiting
+    
+    def check_rate_limit(self, agent_id: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check if agent is within rate limits
+        Returns: (is_allowed, error_message)
+        """
+        if not self.is_enabled():
+            return True, None
+        
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(seconds=self.config.rate_limit_window_seconds)
+        
+        # Clean up old requests
+        self.requests[agent_id] = [
+            req_time for req_time in self.requests[agent_id]
+            if req_time > window_start
+        ]
+        
+        # Check limit
+        if len(self.requests[agent_id]) >= self.config.rate_limit_requests:
+            return False, (
+                f"Rate limit exceeded. Maximum {self.config.rate_limit_requests} requests "
+                f"per {self.config.rate_limit_window_seconds} seconds allowed."
+            )
+        
+        # Record this request
+        self.requests[agent_id].append(now)
+        return True, None
+
+
+class ElicitationManager:
+    """
+    Manages user confirmations for sensitive operations
+    Implements MCP Elicitation primitive (whitepaper page 33)
+    """
+    
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self.pending_confirmations: Dict[str, Dict[str, Any]] = {}
+    
+    def is_enabled(self) -> bool:
+        return self.config.enable_elicitation
+    
+    def requires_confirmation(self, operation: str, context: Dict[str, Any]) -> bool:
+        """Check if operation requires user confirmation"""
+        if not self.is_enabled():
+            return False
+        
+        if operation == "file_overwrite" and self.config.require_confirmation_for_overwrite:
+            return True
+        
+        return False
+    
+    def create_confirmation_request(self, operation: str, context: Dict[str, Any]) -> str:
+        """Create a confirmation request and return its ID"""
+        confirmation_id = secrets.token_urlsafe(16)
+        self.pending_confirmations[confirmation_id] = {
+            "operation": operation,
+            "context": context,
+            "created_at": datetime.now(timezone.utc),
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5)
+        }
+        return confirmation_id
+    
+    def check_confirmation(self, confirmation_id: str) -> Optional[Dict[str, Any]]:
+        """Check if confirmation exists and is valid"""
+        if confirmation_id not in self.pending_confirmations:
+            return None
+        
+        confirmation = self.pending_confirmations[confirmation_id]
+        if datetime.now(timezone.utc) >= confirmation["expires_at"]:
+            del self.pending_confirmations[confirmation_id]
+            return None
+        
+        return confirmation
+    
+    def consume_confirmation(self, confirmation_id: str) -> bool:
+        """Consume a confirmation (one-time use)"""
+        if confirmation_id in self.pending_confirmations:
+            del self.pending_confirmations[confirmation_id]
+            return True
+        return False
 
 
 class MemoryBank:
@@ -395,6 +604,14 @@ class WriteNoteInput(BaseModel):
         description="The full text content of the note in markdown format",
         min_length=1
     )
+    access_token: Optional[str] = Field(
+        default=None,
+        description="OAuth 2.0 access token (required if OAuth is enabled)"
+    )
+    confirmation_id: Optional[str] = Field(
+        default=None,
+        description="Confirmation ID for file overwrites (if elicitation is enabled)"
+    )
     
     @field_validator('folder_name')
     @classmethod
@@ -512,6 +729,9 @@ class GetMemoryInput(BaseModel):
 # Initialize configuration and global components
 config = ServerConfig()
 metrics = Metrics()
+oauth_manager = OAuthManager(config)
+rate_limiter = RateLimiter(config)
+elicitation_manager = ElicitationManager(config)
 
 # Setup structured logging
 logger = logging.getLogger("mcp_server")
@@ -591,6 +811,45 @@ def audit_log(action: str, details: Dict[str, Any], agent_id: Optional[str] = No
     audit_logger.info(json.dumps(audit_entry))
 
 
+def check_authorization(access_token: Optional[str], required_scope: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Check OAuth authorization for the request
+    Returns: (is_authorized, agent_id, error_message)
+    """
+    if not oauth_manager.is_enabled():
+        # OAuth disabled, allow with development agent
+        return True, "development", None
+    
+    if not access_token:
+        return False, None, "Missing access token. OAuth is enabled."
+    
+    token = oauth_manager.validate_token(access_token)
+    if not token:
+        return False, None, "Invalid or expired access token."
+    
+    if not token.has_scope(required_scope):
+        return False, token.agent_id, f"Insufficient permissions. Required scope: {required_scope}"
+    
+    return True, token.agent_id, None
+
+
+def sanitize_output(data: Any, max_preview_length: int = 200) -> Any:
+    """
+    Sanitize output to prevent information leaks
+    Addresses whitepaper concern about sensitive information exposure (page 45)
+    """
+    if isinstance(data, str):
+        # Truncate long strings to prevent leaking full file contents
+        if len(data) > max_preview_length:
+            return data[:max_preview_length] + "... [truncated]"
+        return data
+    elif isinstance(data, dict):
+        return {k: sanitize_output(v, max_preview_length) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_output(item, max_preview_length) for item in data]
+    return data
+
+
 def validate_path_within_root(folder_path: Path, root_path: Path) -> bool:
     """
     Validate that the folder path is within the root boundary.
@@ -631,7 +890,7 @@ knowledge_extractor = KnowledgeExtractor()
 # Initialize FastMCP
 mcp = FastMCP(
     "strategic-note-taking-mcp-server",
-    version="4.0.0"  # Day 2: Added semantic search and memory bank
+    version="5.0.0"  # Enhanced with Resources, Prompts, Elicitation, Rate Limiting, OAuth
 )
 
 # Roots Security Pattern: Documented root boundary
@@ -643,15 +902,215 @@ ROOT_BOUNDARY_URI = f"file://{notes_base_path.absolute()}"
 logger.info(
     "MCP Server initialized with FastMCP",
     extra={
-        "version": "4.0.0",
+        "version": "5.0.0",
         "environment": config.environment,
         "notes_path": str(notes_base_path.absolute()),
         "memory_path": str(memory_path.absolute()),
         "root_boundary": ROOT_BOUNDARY_URI,
-        "semantic_search_enabled": SEMANTIC_SEARCH_AVAILABLE
+        "semantic_search_enabled": SEMANTIC_SEARCH_AVAILABLE,
+        "oauth_enabled": oauth_manager.is_enabled(),
+        "rate_limiting_enabled": rate_limiter.is_enabled(),
+        "elicitation_enabled": elicitation_manager.is_enabled()
     }
 )
 
+
+# ============================================================================
+# RESOURCES PRIMITIVE - MCP Whitepaper Pages 31
+# Expose notes as readable resources with URI scheme: note://{folder}/{file}
+# ============================================================================
+
+@mcp.resource("note://{folder}/{filename}")
+def read_note_resource(folder: str, filename: str) -> str:
+    """
+    Read a note as a resource.
+    Resources provide direct read access to notes without custom tools.
+    URI format: note://folder-name/file-name.md
+    """
+    try:
+        # Validate folder and filename
+        if ".." in folder or "/" in folder or "\\" in folder:
+            raise ValueError("Invalid folder name")
+        if ".." in filename or "/" in filename or "\\" in filename:
+            raise ValueError("Invalid filename")
+        
+        folder_path = notes_base_path / folder
+        note_path = folder_path / filename
+        
+        # Validate within root boundary
+        if not validate_path_within_root(note_path, notes_base_path):
+            raise ValueError("Path outside root boundary")
+        
+        if not note_path.exists():
+            raise ValueError(f"Note not found: {folder}/{filename}")
+        
+        content = note_path.read_text(encoding='utf-8')
+        
+        logger.info(f"Resource accessed: note://{folder}/{filename}")
+        
+        return content
+    
+    except Exception as e:
+        logger.error(f"Error reading resource: {e}")
+        raise
+
+
+@mcp.resource("note://{folder}/")
+def list_notes_in_folder_resource(folder: str) -> str:
+    """
+    List all notes in a folder as a resource.
+    URI format: note://folder-name/
+    """
+    try:
+        # Validate folder
+        if ".." in folder or "/" in folder or "\\" in folder:
+            raise ValueError("Invalid folder name")
+        
+        folder_path = notes_base_path / folder
+        
+        # Validate within root boundary
+        if not validate_path_within_root(folder_path, notes_base_path):
+            raise ValueError("Path outside root boundary")
+        
+        if not folder_path.exists():
+            raise ValueError(f"Folder not found: {folder}")
+        
+        # List markdown files
+        notes = []
+        for note_file in folder_path.glob("*.md"):
+            notes.append({
+                "name": note_file.name,
+                "size": note_file.stat().st_size,
+                "modified": datetime.fromtimestamp(note_file.stat().st_mtime, tz=timezone.utc).isoformat(),
+                "uri": f"note://{folder}/{note_file.name}"
+            })
+        
+        result = {
+            "folder": folder,
+            "notes": notes,
+            "count": len(notes)
+        }
+        
+        logger.info(f"Resource accessed: note://{folder}/")
+        
+        return json.dumps(result, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Error listing folder resource: {e}")
+        raise
+
+
+# ============================================================================
+# PROMPTS PRIMITIVE - MCP Whitepaper Pages 31
+# Predefined prompts for common workflows
+# ============================================================================
+
+@mcp.prompt()
+def job_application_workflow() -> str:
+    """
+    Prompt: Job Application Review Workflow
+    
+    A structured workflow for reviewing and tracking job applications.
+    This guides the AI through the complete process of analyzing a job posting,
+    comparing it with user skills, and creating appropriate notes.
+    """
+    return """You are helping the user review and track a job application.
+
+Follow this workflow:
+
+1. **Gather Information**
+   - Ask the user to share the job posting details
+   - Get the memory context using get_memory to retrieve their skills and preferences
+
+2. **Analyze the Job**
+   - Identify key requirements and responsibilities
+   - Compare with user's skills from long-term memory
+   - Note any skill gaps or growth opportunities
+   - Assess cultural and preference fit
+
+3. **Create Documentation**
+   - Use write_note to save the analysis to the job-applications folder
+   - Include: company name, position, key requirements, fit assessment, action items
+   - Update short-term memory with this active application
+
+4. **Follow-up Actions**
+   - Suggest next steps (tailor resume, prepare for interviews, etc.)
+   - Offer to create additional notes for preparation
+
+Remember: Be strategic, thorough, and supportive throughout the process."""
+
+
+@mcp.prompt()
+def project_idea_brainstorm() -> str:
+    """
+    Prompt: Project Idea Brainstorming Session
+    
+    A creative workflow for capturing and organizing project ideas.
+    """
+    return """You are helping the user brainstorm and document project ideas.
+
+Follow this workflow:
+
+1. **Exploration Phase**
+   - Ask about the project domain or area of interest
+   - Explore what technologies or skills they want to use/learn
+   - Review their existing skills from long-term memory
+
+2. **Ideation**
+   - Generate 3-5 concrete project ideas
+   - For each idea, outline:
+     * Core functionality
+     * Technical stack
+     * Learning outcomes
+     * Estimated complexity
+
+3. **Documentation**
+   - Save the most promising ideas to the work folder
+   - Structure each note with: Overview, Technical Details, Learning Goals, Next Steps
+
+4. **Prioritization**
+   - Help rank ideas by feasibility and learning value
+   - Update short-term memory with selected project focus
+
+Be creative, practical, and encouraging!"""
+
+
+@mcp.prompt()
+def daily_reflection() -> str:
+    """
+    Prompt: Daily Reflection and Note Review
+    
+    A reflective workflow for reviewing notes and consolidating knowledge.
+    """
+    return """You are facilitating the user's daily reflection and note review.
+
+Follow this workflow:
+
+1. **Context Retrieval**
+   - Get all memory to understand current focus
+   - Use search_notes to find recent notes
+
+2. **Review Session**
+   - Summarize key themes from recent notes
+   - Identify patterns or recurring topics
+   - Note any action items or follow-ups
+
+3. **Memory Consolidation**
+   - Extract important facts, skills, or insights
+   - Update long-term memory with new learnings
+   - Clear or update short-term memory as needed
+
+4. **Forward Planning**
+   - Suggest areas for tomorrow's focus
+   - Identify knowledge gaps to address
+   - Offer to create planning notes
+
+Be reflective, insightful, and forward-thinking!"""
+
+
+# ============================================================================
+# TOOL IMPLEMENTATIONS
+# ============================================================================
 
 def _list_note_folders_impl() -> str:
     """Implementation of list_note_folders tool"""
@@ -709,7 +1168,8 @@ def _list_note_folders_impl() -> str:
             raise
 
 
-def _write_note_impl(input: WriteNoteInput) -> str:
+def _write_note_impl(input: WriteNoteInput, access_token: Optional[str] = None, 
+                     confirmation_id: Optional[str] = None) -> str:
     """
     Saves a text note into a specific folder. Use this only AFTER
     identifying the correct target folder via list_note_folders.
@@ -718,8 +1178,16 @@ def _write_note_impl(input: WriteNoteInput) -> str:
     complete note content in markdown format. Includes security
     validation and size limits for production safety.
     
+    Enhanced with:
+    - OAuth 2.0 authorization (requires notes:write scope)
+    - Rate limiting per agent
+    - Elicitation for file overwrites
+    - Output sanitization
+    
     Args:
         input: Validated input containing folder_name, file_name, and content
+        access_token: OAuth 2.0 access token (optional if OAuth disabled)
+        confirmation_id: Confirmation ID for file overwrites (if elicitation enabled)
     
     Returns:
         JSON string with success confirmation and metadata
@@ -730,10 +1198,25 @@ def _write_note_impl(input: WriteNoteInput) -> str:
         try:
             metrics.record_tool_call("write_note")
             
+            # 1. AUTHORIZATION CHECK (OAuth 2.0)
+            is_authorized, agent_id, auth_error = check_authorization(access_token, "notes:write")
+            if not is_authorized:
+                metrics.record_tool_error("write_note", ErrorCategory.SECURITY_ERROR)
+                span.set_status(Status(StatusCode.ERROR, "Authorization failed"))
+                raise ValueError(f"Authorization error: {auth_error}")
+            
+            # 2. RATE LIMITING CHECK
+            is_allowed, rate_error = rate_limiter.check_rate_limit(agent_id)
+            if not is_allowed:
+                metrics.record_tool_error("write_note", ErrorCategory.VALIDATION_ERROR)
+                span.set_status(Status(StatusCode.ERROR, "Rate limit exceeded"))
+                raise ValueError(rate_error)
+            
             # Add span attributes
             span.set_attribute("folder_name", input.folder_name)
             span.set_attribute("file_name", input.file_name)
             span.set_attribute("content_size_bytes", len(input.content.encode('utf-8')))
+            span.set_attribute("agent_id", agent_id)
             
             # Validate file size
             content_size_mb = len(input.content.encode('utf-8')) / (1024 * 1024)
@@ -774,7 +1257,7 @@ def _write_note_impl(input: WriteNoteInput) -> str:
                     f"Use list_note_folders to see valid options."
                 )
             
-            # Write the note
+            # Prepare note path
             note_path = target_folder / input.file_name
             
             # Final validation that note path is within root
@@ -782,6 +1265,48 @@ def _write_note_impl(input: WriteNoteInput) -> str:
                 metrics.record_tool_error("write_note", ErrorCategory.SECURITY_ERROR)
                 raise ValueError("Security error: Note path outside root boundary")
             
+            # 3. ELICITATION CHECK (User confirmation for overwrites)
+            file_exists = note_path.exists()
+            if file_exists and elicitation_manager.requires_confirmation("file_overwrite", {"path": str(note_path)}):
+                # Check if confirmation was provided
+                if not confirmation_id:
+                    # Create confirmation request
+                    new_confirmation_id = elicitation_manager.create_confirmation_request(
+                        "file_overwrite",
+                        {
+                            "path": str(note_path),
+                            "folder": input.folder_name,
+                            "file": input.file_name,
+                            "agent_id": agent_id
+                        }
+                    )
+                    
+                    return json.dumps({
+                        "success": False,
+                        "requires_confirmation": True,
+                        "confirmation_id": new_confirmation_id,
+                        "message": f"File '{input.folder_name}/{input.file_name}' already exists. "
+                                   f"Please confirm overwrite by calling this tool again with confirmation_id.",
+                        "context": {
+                            "operation": "file_overwrite",
+                            "existing_file": str(note_path)
+                        }
+                    }, indent=2)
+                else:
+                    # Validate confirmation
+                    confirmation = elicitation_manager.check_confirmation(confirmation_id)
+                    if not confirmation:
+                        raise ValueError("Invalid or expired confirmation ID")
+                    
+                    # Check that confirmation matches this operation
+                    if confirmation["context"]["path"] != str(note_path):
+                        raise ValueError("Confirmation ID does not match this operation")
+                    
+                    # Consume confirmation
+                    elicitation_manager.consume_confirmation(confirmation_id)
+                    logger.info(f"File overwrite confirmed for {note_path}")
+            
+            # Write the note
             note_path.write_text(input.content, encoding='utf-8')
             
             # Day 2: Extract key facts from the note
@@ -824,8 +1349,10 @@ def _write_note_impl(input: WriteNoteInput) -> str:
                     "size_bytes": len(input.content.encode('utf-8')),
                     "path": str(note_path.absolute()),
                     "extracted_skills": len(extracted_facts.get('skills', [])),
-                    "extracted_preferences": len(extracted_facts.get('preferences', []))
-                }
+                    "extracted_preferences": len(extracted_facts.get('preferences', [])),
+                    "file_overwritten": file_exists
+                },
+                agent_id=agent_id
             )
             
             span.set_status(Status(StatusCode.OK))
@@ -842,7 +1369,8 @@ def _write_note_impl(input: WriteNoteInput) -> str:
                 }
             )
             
-            return json.dumps({
+            # Prepare response with sanitization
+            response_data = {
                 "success": True,
                 "message": f"Note successfully saved to {input.folder_name}/{input.file_name}",
                 "path": str(note_path.absolute()),
@@ -851,8 +1379,14 @@ def _write_note_impl(input: WriteNoteInput) -> str:
                     "skills_found": len(extracted_facts.get('skills', [])),
                     "preferences_found": len(extracted_facts.get('preferences', [])),
                     "indexed_for_search": SEMANTIC_SEARCH_AVAILABLE
-                }
-            }, indent=2)
+                },
+                "file_overwritten": file_exists
+            }
+            
+            # Apply output sanitization
+            sanitized_response = sanitize_output(response_data)
+            
+            return json.dumps(sanitized_response, indent=2)
         
         except ValueError as e:
             # Re-raise validation errors (already logged)
@@ -889,7 +1423,7 @@ def _get_health_status_impl() -> str:
         
         health_data = {
             "status": "healthy" if notes_accessible else "degraded",
-            "version": "4.0.0",  # Day 2 version
+            "version": "5.0.0",  # Enhanced version with full MCP primitives
             "environment": config.environment,
             "notes_path": str(notes_base_path.absolute()),
             "notes_accessible": notes_accessible,
@@ -899,7 +1433,17 @@ def _get_health_status_impl() -> str:
                 "pydantic_validation": True,
                 "path_security": True,
                 "root_boundaries": True,
-                "audit_logging": config.enable_audit_log
+                "audit_logging": config.enable_audit_log,
+                "oauth_enabled": oauth_manager.is_enabled(),
+                "rate_limiting_enabled": rate_limiter.is_enabled(),
+                "elicitation_enabled": elicitation_manager.is_enabled(),
+                "output_sanitization": True
+            },
+            "mcp_primitives": {
+                "tools": True,
+                "resources": True,
+                "prompts": True,
+                "elicitation": elicitation_manager.is_enabled()
             },
             "day2_features": {
                 "semantic_search": SEMANTIC_SEARCH_AVAILABLE,
@@ -907,6 +1451,15 @@ def _get_health_status_impl() -> str:
                 "vector_index_size": vector_manager.index.ntotal if SEMANTIC_SEARCH_AVAILABLE and vector_manager.index else 0,
                 "short_term_memory_keys": len(memory_bank.short_term_memory),
                 "long_term_memory_keys": len(memory_bank.long_term_memory)
+            },
+            "rate_limiting": {
+                "enabled": rate_limiter.is_enabled(),
+                "requests_per_window": config.rate_limit_requests,
+                "window_seconds": config.rate_limit_window_seconds
+            },
+            "oauth": {
+                "enabled": oauth_manager.is_enabled(),
+                "active_tokens": len(oauth_manager.tokens) if oauth_manager.is_enabled() else 0
             },
             "metrics": metrics.get_stats(),
             "uptime_check": datetime.now(timezone.utc).isoformat()
@@ -1161,18 +1714,28 @@ def write_note(input: WriteNoteInput) -> str:
     """
     Saves a text note into a specific folder. Use this only AFTER
     identifying the correct target folder via list_note_folders.
-    This tool requires three pieces of information: the folder name
-    (which must exist), the file name (should end in .md), and the
-    complete note content in markdown format. Includes security
-    validation and size limits for production safety.
+    
+    This tool requires:
+    - folder_name: The category folder (must exist)
+    - file_name: The note filename (should end in .md)
+    - content: The complete note content in markdown format
+    - access_token: OAuth 2.0 token (optional if OAuth disabled)
+    - confirmation_id: For file overwrites (if elicitation enabled)
+    
+    Enhanced security features:
+    - OAuth 2.0 authorization (requires notes:write scope)
+    - Rate limiting per agent
+    - User confirmation for file overwrites
+    - Output sanitization to prevent info leaks
     
     Args:
-        input: Validated input containing folder_name, file_name, and content
+        input: Validated input containing all required fields
     
     Returns:
-        JSON string with success confirmation and metadata
+        JSON string with success confirmation and metadata, or
+        confirmation request if file exists and elicitation is enabled
     """
-    return _write_note_impl(input)
+    return _write_note_impl(input, input.access_token, input.confirmation_id)
 
 
 @mcp.tool()
@@ -1258,6 +1821,108 @@ def get_memory(input: GetMemoryInput) -> str:
         JSON string with memory contents
     """
     return _get_memory_impl(input)
+
+
+@mcp.tool()
+def request_authorization() -> str:
+    """
+    Request OAuth 2.0 authorization.
+    
+    This initiates the authorization flow by generating an authorization code.
+    In a production environment, this would redirect the user to an OAuth provider.
+    For this implementation, it generates a code that can be exchanged for a token.
+    
+    Returns:
+        JSON with authorization code and instructions
+    """
+    try:
+        if not oauth_manager.is_enabled():
+            return json.dumps({
+                "success": False,
+                "message": "OAuth is not enabled. Set ENABLE_OAUTH=true to enable authorization."
+            }, indent=2)
+        
+        # In production, agent_id would come from user authentication
+        # For now, generate a unique agent ID
+        agent_id = f"agent_{secrets.token_urlsafe(8)}"
+        
+        # Request all available scopes by default
+        code = oauth_manager.generate_authorization_code(
+            agent_id=agent_id,
+            scopes=config.oauth_scopes
+        )
+        
+        logger.info(f"Authorization code generated for agent: {agent_id}")
+        
+        return json.dumps({
+            "success": True,
+            "authorization_code": code,
+            "agent_id": agent_id,
+            "scopes": config.oauth_scopes,
+            "expires_in_seconds": 600,
+            "instructions": "Use exchange_token with this authorization code to get an access token."
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Error requesting authorization: {e}", exc_info=True)
+        raise
+
+
+@mcp.tool()
+def exchange_token(authorization_code: str) -> str:
+    """
+    Exchange authorization code for access token.
+    
+    This completes the OAuth 2.0 authorization flow by exchanging
+    an authorization code for an access token that can be used with
+    other tools.
+    
+    Args:
+        authorization_code: The code received from request_authorization
+    
+    Returns:
+        JSON with access token and token details
+    """
+    try:
+        if not oauth_manager.is_enabled():
+            return json.dumps({
+                "success": False,
+                "message": "OAuth is not enabled."
+            }, indent=2)
+        
+        token = oauth_manager.exchange_code_for_token(authorization_code)
+        
+        if not token:
+            return json.dumps({
+                "success": False,
+                "error": "Invalid or expired authorization code"
+            }, indent=2)
+        
+        logger.info(f"Access token issued for agent: {token.agent_id}")
+        
+        audit_log(
+            action="token_issued",
+            details={
+                "agent_id": token.agent_id,
+                "scopes": token.scopes,
+                "expires_at": token.expires_at.isoformat()
+            },
+            agent_id=token.agent_id
+        )
+        
+        return json.dumps({
+            "success": True,
+            "access_token": token.access_token,
+            "token_type": token.token_type,
+            "expires_in_seconds": int((token.expires_at - datetime.now(timezone.utc)).total_seconds()),
+            "scopes": token.scopes,
+            "agent_id": token.agent_id,
+            "instructions": "Include this access_token in the access_token field when calling protected tools."
+        }, indent=2)
+    
+    except Exception as e:
+        logger.error(f"Error exchanging token: {e}", exc_info=True)
+        raise
 
 
 # Export implementation functions for testing (bypasses FastMCP wrappers)
